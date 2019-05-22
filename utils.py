@@ -1,4 +1,3 @@
-import h5py
 import math
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,8 +7,16 @@ import tensorflow as tf
 
 from controller import iLQR
 
-# Plot predictions against true time evolution
 def visualize_predictions(args, sess, net, replay_memory, env, e=0):
+    """Plot predictions for a system against true time evolution
+    Args:
+        args: Various arguments and specifications
+        sess: TensorFlow session
+        net: Neural network dynamics model
+        replay_memory: Object containing training/validation data
+        env: Simulation environment
+        e: Current training epoch
+    """
 	# Get inputs (test trajectory that is twice the size of a standard sequence)
     x = np.zeros((args.batch_size, 2*args.seq_length, args.state_dim), dtype=np.float32)
     u = np.zeros((args.batch_size, 2*args.seq_length-1, args.action_dim), dtype=np.float32)
@@ -69,18 +76,16 @@ def visualize_predictions(args, sess, net, replay_memory, env, e=0):
     plt.xlabel('Time Step')
     plt.xlim([1, 2*args.seq_length-1])
     plt.savefig('vk_predictions/predictions_' + str(e) + '.png')
-
-
-# Function to display results
-J_hist = []
-def on_iteration(iteration_count, xs, us, J_opt, accepted, converged):
-    J_hist.append(J_opt)
-    info = "converged" if converged else ("accepted" if accepted else "failed")
-    final_state = xs[-1]
-    print("iteration", iteration_count, info, J_opt)
-
-# Define cost function for inverted pendulum
+ 
 def pendulum_cost(states, us, gamma):
+    """Define cost function for inverted pendulum
+    Args:
+        states: Sequence of state values [num_models, N, state_dim]
+        us: Sequence of control inputs [N-1, action_dim]
+        gamma: Discount factor
+    Returns:
+        List of (discounted) cost values at each time step
+    """
     num_models = len(states)
     N = states.shape[1]
     thetas = np.arctan2(states[:, :, 1], states[:, :, 0])
@@ -93,8 +98,25 @@ def pendulum_cost(states, us, gamma):
     # Return discounted cost
     return [gamma**t*exp_cost[t] for t in range(N)]
 
-# Function to perform model predictive control
-def perform_mpc(args, net, env, sess, n_trials, render=False, evaluate=True, seed=-1, worst_case=False):
+def perform_mpc(args, net, env, sess, render=False, seed=-1, worst_case=False):
+    """Function to perform model predictive control
+    Args:
+        args: Various arguments and specifications
+        net: Neural network dynamics model
+        env: Simulation environment
+        sess: TensorFlow session
+        render: Whether to render environment during rollout
+        replay_memory: Object containing training/validation data
+        seed: Random seed
+        worst_case: Whether to optimize for worst case  
+    Returns:
+        Tuple of
+            reward: Number of time steps vertical (specific to inverted pendulum environment)
+            x_replay: Observed states during rollout
+            u_replay: Observed actions during rollout
+            cost: Cumulative environment cost
+            fall_count: Number of falls from vertical (specific to inverted pendulum environment)
+    """
     # Get normalization params
     shift = sess.run(net.shift)
     scale = sess.run(net.scale)
@@ -135,6 +157,7 @@ def perform_mpc(args, net, env, sess, n_trials, render=False, evaluate=True, see
     vertical = False
     vertical_count = 0
     fall_count = 0
+    time_sum = 0.0
 
     # Loop through time
     for t in range(1, args.trial_len):
@@ -175,11 +198,8 @@ def perform_mpc(args, net, env, sess, n_trials, render=False, evaluate=True, see
             Bs = Bs_full[:args.num_models]
             z0s = z0s_full[:args.num_models]
 
-            # If evaluating controller, perform more iterations
-            if evaluate:
-                n_iterations = 15
-            else:
-                n_iterations = 1
+            # Define number of iterations
+            n_iterations = 5
             
             # At initial time step perform 100+ iterations to get good initial action sequence
             if t == args.seq_length:
@@ -227,10 +247,19 @@ def perform_mpc(args, net, env, sess, n_trials, render=False, evaluate=True, see
     bar.finish()
     return reward, x_replay, u_replay, cost[0], fall_count
 
-# Function to perform rollouts with trained model
 def perform_rollouts(args, net, env, sess, replay_memory):
+    """Function to perform rollouts with trained model
+    Args:
+        args: Various arguments and specifications
+        net: Neural network dynamics model
+        env: Simulation environment
+        sess: TensorFlow session
+        replay_memory: Object containing training/validation data
+    Returns:
+        Average reward across rollouts
+    """
     print('Performing rollouts...')
-    n_trials = args.n_trials//5
+    n_trials = args.n_trials//10
     rewards = 0.0
 
     # Initialize arrays to hold data to be added to replay buffer
@@ -238,7 +267,7 @@ def perform_rollouts(args, net, env, sess, replay_memory):
     u_replay = np.zeros((n_trials, args.n_subseq, replay_memory.seq_length-1, args.action_dim), dtype=np.float32)
     for n in range(n_trials):
         # Perform MPC to evaluate model and get new training data
-        reward, x_replay_n, u_replay_n, cost_norm, falls = perform_mpc(args, net, env, sess, 1, evaluate=True, worst_case=args.worst_case)
+        reward, x_replay_n, u_replay_n, cost_norm, falls = perform_mpc(args, net, env, sess, worst_case=args.worst_case)
 
         # Divide into subsequences
         for j in range(args.n_subseq):
@@ -254,12 +283,4 @@ def perform_rollouts(args, net, env, sess, replay_memory):
 
     # Return average reward
     return rewards/n_trials
-
-
-
-
-
-
-
-
 

@@ -3,13 +3,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import gym
-from variational_koopman_model import VariationalKoopman
 import numpy as np
 import progressbar
-from replay_memory import ReplayMemory
+import random
 import tensorflow as tf
 import time
-import random
+
+from replay_memory import ReplayMemory
+from variational_koopman_model import VariationalKoopman
 from utils import visualize_predictions, perform_rollouts
 
 def main():
@@ -128,7 +129,7 @@ def train(args, net, env):
         # Specify number of times to loop through training procedure
         n_loops = 10 if args.ilqr else 1
         for n in range(n_loops):
-            # Re-initialize network parameters if after the first loop
+            # Re-initialize network parameters if after the first loop (in place of fine-tuning since training is cheap)
             if n >= 1:
                 tf.global_variables_initializer().run()
 

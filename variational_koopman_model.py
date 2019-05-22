@@ -4,6 +4,10 @@ import pdb
 
 class VariationalKoopman():
     def __init__(self, args):
+        """Constructs Deep Variational Koopman Model 
+        Args:
+            args: Various arguments and specifications
+        """
 
         # Placeholder for states and control inputs
         self.x = tf.Variable(np.zeros((2*args.batch_size*args.seq_length, args.state_dim), dtype=np.float32), trainable=False, name="state_values")
@@ -36,8 +40,11 @@ class VariationalKoopman():
             self._find_ilqr_params(args)
         self._create_optimizer(args)
 
-    # Create parameters to comprise ifeature extractor
     def _create_feature_extractor_params(self, args):
+        """Create parameters to comprise feature extractor
+        Args:
+            args: Various arguments and specifications
+        """
         self.extractor_w = []
         self.extractor_b = []
 
@@ -56,21 +63,33 @@ class VariationalKoopman():
                                                 regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
         self.extractor_b.append(tf.get_variable("extractor_b_end", [args.latent_dim]))
 
-    # Function to run inputs through extractor
     def _get_extractor_output(self, args, states):
+        """Function to run inputs through extractor
+        Args:
+            args: Various arguments and specifications
+            states: states to feed into extractor [2*batch_size*seq_length, state_dim]
+        Returns:
+            Extracted features
+        """
         extractor_input = states
         for i in range(len(args.extractor_size)):
             extractor_input = tf.nn.relu(tf.nn.xw_plus_b(extractor_input, self.extractor_w[i], self.extractor_b[i]))
         output = tf.nn.xw_plus_b(extractor_input, self.extractor_w[-1], self.extractor_b[-1])
         return output
 
-    # Create feature extractor (maps state -> features, assumes feature same dimensionality as latent states)
     def _create_feature_extractor(self, args):
+        """Create feature extractor (maps state -> features, assumes feature same dimensionality as latent states)
+        Args:
+            args: Various arguments and specifications
+        """
         features = self._get_extractor_output(args, self.x)
         self.features = tf.reshape(features, [args.batch_size, 2*args.seq_length, args.latent_dim])
 
-    # Bidirectional LSTM to generate temporal encoding (also generate distribution over g1 here)
     def _create_temporal_encoder(self, args):
+        """Bidirectional LSTM to generate temporal encoding (also generate distribution over g1 here)
+        Args:
+            args: Various arguments and specifications
+        """
         # Define forward and backward layers
         fwd_cell = tf.nn.rnn_cell.LSTMCell(args.rnn_size, initializer=tf.contrib.layers.xavier_initializer())
         bwd_cell = tf.nn.rnn_cell.LSTMCell(args.rnn_size, initializer=tf.contrib.layers.xavier_initializer())
@@ -93,7 +112,7 @@ class VariationalKoopman():
                                     units=args.latent_dim, 
                                     kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
 
-        # Now construct distribution over gT through transformation with single hidden layer
+        # Now construct distribution over g1 through transformation with single hidden layer
         g_input = tf.concat([self.temporal_encoding, self.features[:, 0]], axis=1)
         hidden = tf.layers.dense(g_input, 
                                     units=args.transform_size, 
@@ -103,8 +122,11 @@ class VariationalKoopman():
                                         units=2*args.latent_dim,
                                         kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
 
-    # Create parameters to comprise inference network
     def _create_inference_network_params(self, args):
+        """Create parameters to comprise inference network
+        Args:
+            args: Various arguments and specifications
+        """
         self.inference_w = []
         self.inference_b = []
 
@@ -122,17 +144,31 @@ class VariationalKoopman():
         self.inference_w.append(tf.get_variable("inference_w_end", [args.inference_size[-1], 2*args.latent_dim], 
                                                 regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
         self.inference_b.append(tf.get_variable("inference_b_end", [2*args.latent_dim]))
-
-    # Function to infer distribution over g
+ 
     def _get_inference_distribution(self, args, features, u, g_enc):
+        """Function to infer distribution over g
+        Args:
+            args: Various arguments and specifications
+            features: Extracted features [batch_size, latent_dim]
+            u: Control input [batch_size, action_dim]
+            g_enc: Temporal encoding of previous g-values [batch_size, latent_dim]
+        Returns:
+            Next g-value
+        """
         inference_input = tf.concat([features, u, self.temporal_encoding, g_enc], axis=1)
         for i in range(len(args.inference_size)):
             inference_input = tf.nn.relu(tf.nn.xw_plus_b(inference_input, self.inference_w[i], self.inference_b[i]))
         g_dist = tf.nn.xw_plus_b(inference_input, self.inference_w[-1], self.inference_b[-1])
         return g_dist
 
-    # Function to generate samples given distribution parameters
     def _gen_sample(self, args, dist_params):
+        """Function to generate samples given distribution parameters
+        Args:
+            args: Various arguments and specifications
+            dist_params: Mean and logstd of distribution [batch_size, 2*latent_dim]
+        Returns:
+            g: Sampled g-value [batch_size, latent_dim]
+        """
         g_mean, g_logstd = tf.split(dist_params, [args.latent_dim, args.latent_dim], axis=1)
 
         # Make standard deviation estimates better conditioned, otherwise could be problem early in training
@@ -141,8 +177,11 @@ class VariationalKoopman():
         g = samples*g_std + g_mean
         return g
 
-    # Step through time and determine g_t distributions and values
     def _infer_observations(self, args):
+        """Step through time and determine g_t distributions and values
+        Args:
+            args: Various arguments and specifications
+        """
         # Sample value for initial observation from distribution
         self.g_t = self._gen_sample(args, self.g1_dist)
 
@@ -177,12 +216,15 @@ class VariationalKoopman():
             self.g_vals.append(tf.expand_dims(g_t, axis=1))
             self.g_dists.append(tf.expand_dims(g_dist, axis=1))
 
-        # Finally, stack inferred observations and distributions and flip order
+        # Finally, stack inferred observations
         self.g_vals = tf.reshape(tf.stack(self.g_vals, axis=1), [args.batch_size, args.seq_length, args.latent_dim])
-        self.g_dists = tf.reshape(tf.stack(self.g_dists, axis=1)[:, :-1], [args.batch_size*(args.seq_length-1), 2*args.latent_dim])
+        self.g_dists = tf.reshape(tf.stack(self.g_dists, axis=1), [args.batch_size*args.seq_length, 2*args.latent_dim])
 
-    # Construct network and generate paramaters for conditional prior distributions
     def _create_prior_network(self, args):
+        """Construct network and generate paramaters for conditional prior distributions
+        Args:
+            args: Various arguments and specifications
+        """
         gvals_reshape = tf.reshape(self.g_vals[:, :-1], [args.batch_size*(args.seq_length-1), args.latent_dim])
         u_reshape = tf.reshape(self.u[:, :(args.seq_length-1)], [args.batch_size*(args.seq_length-1), args.action_dim])
         prior_input = tf.concat([gvals_reshape, u_reshape], axis=1)
@@ -207,10 +249,13 @@ class VariationalKoopman():
         g_prior = tf.concat([g1_prior, prior_params], axis=1)
 
         # Combine and reshape to get full set of prior distribution parameter values
-        self.g_prior = tf.reshape(g_prior[:, :-1], [args.batch_size*(args.seq_length-1), 2*args.latent_dim])
+        self.g_prior = tf.reshape(g_prior, [args.batch_size*args.seq_length, 2*args.latent_dim])
 
-    # Perform least squares to get A- and B-matrices and propagate forward
     def _propagate_solution(self, args):
+        """Perform least squares to get A- and B-matrices and propagate forward
+        Args:
+            args: Various arguments and specifications
+        """
         # Define X- and Y-matrices
         X = tf.concat([self.g_vals[:, :-1], self.u[:, :(args.seq_length-1)]], axis=2)
         Y = self.g_vals[:, 1:]
@@ -242,8 +287,11 @@ class VariationalKoopman():
         # Reshape predicted z-values
         self.z_vals = tf.reshape(self.z_vals_reshape, [args.batch_size*args.seq_length, args.latent_dim])
 
-    # Create parameters to comprise decoder network
     def _create_decoder_params(self, args):
+        """Create parameters to comprise decoder network
+        Args:
+            args: Various arguments and specifications
+        """
         self.decoder_w = []
         self.decoder_b = []
 
@@ -262,17 +310,25 @@ class VariationalKoopman():
                                                 regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
         self.decoder_b.append(tf.get_variable("decoder_b_end", [args.state_dim]))
 
-    # Function to run inputs through decoder
     def _get_decoder_output(self, args, encodings):
+        """Function to run inputs through decoder
+        Args:
+            args: Various arguments and specifications
+            encodings: Input to decoder [2*batch_size*seq_length, latent_dim]
+        Returns:
+            output: Reconstructed states [2*batch_size*seq_length, state_dim]
+        """
         decoder_input = encodings
         for i in range(len(args.extractor_size)):
             decoder_input = tf.nn.elu(tf.nn.xw_plus_b(decoder_input, self.decoder_w[i], self.decoder_b[i]))
         output = tf.nn.xw_plus_b(decoder_input, self.decoder_w[-1], self.decoder_b[-1])
         return output
 
-
-    # Generate predictions for how system will evolve given z1, A, and B
     def _generate_predictions(self, args):
+        """Generate predictions for how system will evolve given z1, A, and B (used for control, not during training)
+        Args:
+            args: Various arguments and specifications
+        """
         self.z1 = tf.squeeze(self.z_vals_reshape[:, -1])
         z_t = tf.expand_dims(self.z1, axis=1)
         z_pred = [z_t]
@@ -289,20 +345,27 @@ class VariationalKoopman():
         self.x_future_norm = tf.reshape(self._get_decoder_output(args, z_pred), [args.batch_size, args.seq_length, args.state_dim])
         self.x_future = self.x_future_norm*self.scale + self.shift
 
-    # Get cost associated with a set of states and actions
     def _get_cost(self, args, z_u_t):
+        """Get cost associated with a set of states and actions
+        Args:
+            args: Various arguments and specifications
+            z_u_t: Latent state and control input at given time step [batch_size, state_dim+action_dim]
+        Returns:
+            Cost [batch_size]
+        """
         z_t = z_u_t[:, :args.latent_dim]
         u_t = z_u_t[:, args.latent_dim:]
         states = self._get_decoder_output(args, z_t)*self.scale + self.shift
         if args.domain_name == 'Pendulum-v0':
             return tf.square(tf.atan2(states[:, 1], states[:, 0])) + 0.1*tf.square(states[:, 2]) + 0.001*tf.square(tf.squeeze(u_t))
-        elif args.domain_name == 'Swimmer-v2':
-            return -states[:, 0] + 0.001*tf.reduce_sum(tf.square(u_t), axis=1)
         else:
-            return 0.0
+            raise NotImplementedError
 
-    # Find necessary params to perform iLQR
     def _find_ilqr_params(self, args):
+        """Find necessary params to perform iLQR
+        Args:
+            args: Various arguments and specifications
+        """
         # Initialize state
         z_t = self.z1
 
@@ -366,9 +429,11 @@ class VariationalKoopman():
         states_pred = self._get_decoder_output(args, tf.reshape(self.xs, [-1, args.latent_dim]))*self.scale + self.shift
         self.states_pred = tf.reshape(states_pred, [args.batch_size, -1, args.state_dim])
 
-
-    # Create optimizer to minimize loss
     def _create_optimizer(self, args):
+        """Create optimizer to minimize loss
+        Args:
+            args: Various arguments and specifications
+        """
         # First extract mean and std for prior dists, dist over g, and dist over x
         g_prior_mean, g_prior_logstd = tf.split(self.g_prior, [args.latent_dim, args.latent_dim], axis=1)
         g_prior_std = tf.exp(g_prior_logstd) + 1e-6
