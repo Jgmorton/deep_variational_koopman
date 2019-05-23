@@ -1,4 +1,3 @@
-import h5py
 import math
 import numpy as np
 import random
@@ -7,6 +6,18 @@ import progressbar
 # Class to load and preprocess data
 class ReplayMemory():
     def __init__(self, args, shift, scale, shift_u, scale_u, env, net, sess, predict_evolution=False):
+        """Constructs object to hold and update training/validation data.
+        Args:
+            args: Various arguments and specifications
+            shift: Shift of state values for normalization
+            scale: Scaling of state values for normalization
+            shift_u: Shift of action values for normalization
+            scale_u: Scaling of action values for normalization
+            env: Simulation environment
+            net: Neural network dynamics model
+            sess: TensorFlow session
+            predict_evolution: Whether to predict how system will evolve in time
+        """
         self.batch_size = args.batch_size
         self.seq_length = 2*args.seq_length if predict_evolution else args.seq_length
         self.shift_x = shift
@@ -21,7 +32,7 @@ class ReplayMemory():
 
         print("generating data...")
         self._generate_data(args)
-        self._create_inputs_targets(args)
+        self._process_data(args)
 
         print('creating splits...')
         self._create_split(args)
@@ -30,6 +41,10 @@ class ReplayMemory():
         self._shift_scale(args)
 
     def _generate_data(self, args):
+        """Load data from environment
+        Args:
+            args: Various arguments and specifications
+        """
         # Initialize array to hold states and actions
         x = np.zeros((args.n_trials, args.n_subseq, self.seq_length, args.state_dim), dtype=np.float32)
         u = np.zeros((args.n_trials, args.n_subseq, self.seq_length-1, args.action_dim), dtype=np.float32)
@@ -50,9 +65,6 @@ class ReplayMemory():
             # Reset environment and simulate with random actions
             x_trial[0] = self.env.reset()
             for t in range(1, args.trial_len):
-                # if i % 10 == 0 and args.domain_name == 'Pendulum-v0':
-                #     action = np.zeros(args.action_dim)
-                # else:   
                 action = self.env.action_space.sample()  
                 u_trial[t-1] = action
                 step_info = self.env.step(action)
@@ -82,7 +94,11 @@ class ReplayMemory():
         self.x = self.x[:len_x]
         self.u = self.u[:len_x]
 
-    def _create_inputs_targets(self, args):
+    def _process_data(self, args):
+        """Create batch dicts and shuffle data
+        Args:
+            args: Various arguments and specifications
+        """
         # Create batch_dict
         self.batch_dict = {}
 
@@ -99,8 +115,11 @@ class ReplayMemory():
         self.x = self.x[p]
         self.u = self.u[p]
 
-    # Separate data into train/validation sets
     def _create_split(self, args):
+        """Divide data into training/validation sets
+        Args:
+            args: Various arguments and specifications
+        """
         # Compute number of batches
         self.n_batches = len(self.x)//args.batch_size
         self.n_batches_val = int(math.floor(args.val_frac * self.n_batches))
@@ -119,8 +138,11 @@ class ReplayMemory():
         self.reset_batchptr_train()
         self.reset_batchptr_val()
 
-    # Shift and scale data to be zero-mean, unit variance
     def _shift_scale(self, args):
+        """Shift and scale data to be zero-mean, unit variance
+        Args:
+            args: Various arguments and specifications
+        """
         # Find means and std if not initialized to anything
         if np.sum(self.scale_x) == 0.0:
             self.shift_x = np.mean(self.x[:self.n_batches_train], axis=(0, 1))
@@ -140,8 +162,13 @@ class ReplayMemory():
         self.x_test = (self.x_test - self.shift_x)/self.scale_x
         self.u_test = (self.u_test - self.shift_u)/self.scale_u
 
-    # Update training/validation data
     def update_data(self, x_new, u_new, val_frac):
+        """Update training/validation data
+        Args:
+            x_new: New state values
+            u_new: New control inputs
+            val_frac: Fraction of new data to include in validation set
+        """
         # First permute data
         p = np.random.permutation(len(x_new))
         x_new = x_new[p]
@@ -165,8 +192,13 @@ class ReplayMemory():
         self.n_batches_train = len(self.x)//self.batch_size
         self.n_batches_val = len(self.x_val)//self.batch_size
 
-    # Sample a new batch of data
     def next_batch_train(self):
+        """Sample a new batch from training data
+        Args:
+            None
+        Returns:
+            batch_dict: Batch of training data
+        """
         # Extract next batch
         batch_index = self.batch_permuation_train[self.batchptr_train*self.batch_size:(self.batchptr_train+1)*self.batch_size]
         self.batch_dict['states'] = (self.x[batch_index] - self.shift_x)/self.scale_x
@@ -176,13 +208,21 @@ class ReplayMemory():
         self.batchptr_train += 1
         return self.batch_dict
 
-    # Return to first batch in train set
     def reset_batchptr_train(self):
+        """Reset pointer to first batch in training set
+        Args:
+            None
+        """
         self.batch_permuation_train = np.random.permutation(len(self.x))
         self.batchptr_train = 0
 
-    # Return next batch of data in validation set
     def next_batch_val(self):
+        """Sample a new batch from validation data
+        Args:
+            None
+        Returns:
+            batch_dict: Batch of validation data
+        """
         # Extract next validation batch
         batch_index = range(self.batchptr_val*self.batch_size,(self.batchptr_val+1)*self.batch_size)
         self.batch_dict['states'] = (self.x_val[batch_index] - self.shift_x)/self.scale_x
@@ -192,7 +232,10 @@ class ReplayMemory():
         self.batchptr_val += 1
         return self.batch_dict
 
-    # Return to first batch in validation set
     def reset_batchptr_val(self):
+        """Reset pointer to first batch in validation set
+        Args:
+            None
+        """
         self.batchptr_val = 0
 
