@@ -1,3 +1,4 @@
+import h5py
 import math
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,6 +44,12 @@ def visualize_predictions(args, sess, net, replay_memory, env, e=0):
 
         preds = np.concatenate((preds, x_pred), axis=0)       
     preds = preds[1:]
+
+    # # Save predictions and true trajectory to file
+    # f = h5py.File('predictions.h5', 'w')
+    # f['preds'] = preds
+    # f['x_test'] = replay_memory.x_test*sess.run(net.scale) + sess.run(net.shift)
+    # f.close()
 
     # Find mean, max, and min of predictions
     pred_mean = np.mean(preds, axis=0)
@@ -268,6 +275,20 @@ def perform_rollouts(args, net, env, sess, replay_memory):
     for n in range(n_trials):
         # Perform MPC to evaluate model and get new training data
         reward, x_replay_n, u_replay_n, cost_norm, falls = perform_mpc(args, net, env, sess, worst_case=args.worst_case)
+
+        # Save trial data to file
+        print('saving trial data...')
+        f = h5py.File('trial_data.h5', 'r+')
+        states = f['x'][()]
+        actions = f['u'][()]
+        states = np.concatenate((states, np.expand_dims(x_replay_n, axis=0)), axis=0)
+        actions = np.concatenate((actions, np.expand_dims(u_replay_n, axis=0)), axis=0)
+        del f['x']
+        del f['u']
+        f['x'] = states
+        f['u'] = actions
+        f.close()
+        print('done.')
 
         # Divide into subsequences
         for j in range(args.n_subseq):

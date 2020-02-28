@@ -1,11 +1,13 @@
+import h5py
 import math
 import numpy as np
 import random
 import progressbar
+import tensorflow as tf
 
 # Class to load and preprocess data
 class ReplayMemory():
-    def __init__(self, args, shift, scale, shift_u, scale_u, env, net, sess, predict_evolution=False):
+    def __init__(self, args, env, model):
         """Constructs object to hold and update training/validation data.
         Args:
             args: Various arguments and specifications
@@ -16,29 +18,27 @@ class ReplayMemory():
             env: Simulation environment
             net: Neural network dynamics model
             sess: TensorFlow session
-            predict_evolution: Whether to predict how system will evolve in time
         """
         self.batch_size = args.batch_size
-        self.seq_length = 2*args.seq_length if predict_evolution else args.seq_length
-        self.shift_x = shift
-        self.scale_x = scale
-        self.shift_u = shift_u
-        self.scale_u = scale_u
+        self.seq_length = 2*args.seq_length
+        self.shift_x = np.array(model.shift_x.value())
+        self.scale_x = np.array(model.scale_x.value())
+        self.shift_u = np.array(model.shift_u.value())
+        self.scale_u = np.array(model.scale_u.value())
         self.env = env
-        self.net = net
-        self.sess = sess
+        self.model = model
 
         print('validation fraction: ', args.val_frac)
 
         print("generating data...")
         self._generate_data(args)
-        self._process_data(args)
+        # self._process_data(args)
 
-        print('creating splits...')
-        self._create_split(args)
+        # print('creating splits...')
+        # self._create_split(args)
 
-        print('shifting/scaling data...')
-        self._shift_scale(args)
+        # print('shifting/scaling data...')
+        # self._shift_scale(args)
 
     def _generate_data(self, args):
         """Load data from environment
@@ -48,6 +48,9 @@ class ReplayMemory():
         # Initialize array to hold states and actions
         x = np.zeros((args.n_trials, args.n_subseq, self.seq_length, args.state_dim), dtype=np.float32)
         u = np.zeros((args.n_trials, args.n_subseq, self.seq_length-1, args.action_dim), dtype=np.float32)
+
+        trial_states = np.zeros((args.n_trials, args.trial_len, args.state_dim))
+        trial_actions = np.zeros((args.n_trials, args.trial_len-1, args.action_dim))
 
         # Define progress bar
         bar = progressbar.ProgressBar(maxval=args.n_trials).start()
@@ -70,12 +73,16 @@ class ReplayMemory():
                 step_info = self.env.step(action)
                 x_trial[t] = np.squeeze(step_info[0])
 
+            trial_states[i] = x_trial
+            trial_actions[i] = u_trial
+
             # Divide into subsequences
             for j in range(args.n_subseq):
                 x[i, j] = x_trial[int(self.start_idxs[j]):(int(self.start_idxs[j])+self.seq_length)]
                 u[i, j] = u_trial[int(self.start_idxs[j]):(int(self.start_idxs[j])+self.seq_length-1)]
             bar.update(i)
         bar.finish()
+
 
         # Generate test scenario that is double the length of standard sequences
         self.x_test = np.zeros((2*args.seq_length, args.state_dim), dtype=np.float32)
@@ -88,40 +95,21 @@ class ReplayMemory():
             self.x_test[t] = np.squeeze(step_info[0])
 
         # Reshape and trim data sets
-        self.x = x.reshape(-1, self.seq_length, args.state_dim)
-        self.u = u.reshape(-1, self.seq_length-1, args.action_dim)
-        len_x = int(np.floor(len(self.x)/args.batch_size)*args.batch_size)
-        self.x = self.x[:len_x]
-        self.u = self.u[:len_x]
-
-    def _process_data(self, args):
-        """Create batch dicts and shuffle data
-        Args:
-            args: Various arguments and specifications
-        """
-        # Create batch_dict
-        self.batch_dict = {}
-
-        # Print tensor shapes
-        print('states: ', self.x.shape)
-        print('inputs: ', self.u.shape)
-            
-        self.batch_dict['states'] = np.zeros((args.batch_size, self.seq_length, args.state_dim))
-        self.batch_dict['inputs'] = np.zeros((args.batch_size, self.seq_length-1, args.action_dim))
+        x = x.reshape(-1, self.seq_length, args.state_dim)
+        u = u.reshape(-1, self.seq_length-1, args.action_dim)
+        len_x = int(np.floor(len(x)/args.batch_size)*args.batch_size)
+        x = x[:len_x]
+        u = u[:len_x]
 
         # Shuffle data before splitting into train/val
         print('shuffling...')
-        p = np.random.permutation(len(self.x))
-        self.x = self.x[p]
-        self.u = self.u[p]
+        p = np.random.permutation(len(x))
+        x = x[p]
+        u = u[p]
 
-    def _create_split(self, args):
-        """Divide data into training/validation sets
-        Args:
-            args: Various arguments and specifications
-        """
+        print('creating splits...')
         # Compute number of batches
-        self.n_batches = len(self.x)//args.batch_size
+        self.n_batches = len(x)//args.batch_size
         self.n_batches_val = int(math.floor(args.val_frac * self.n_batches))
         self.n_batches_train = self.n_batches - self.n_batches_val
 
@@ -129,10 +117,61 @@ class ReplayMemory():
         print('num validation batches: ', self.n_batches_val)
 
         # Divide into train and validation datasets
-        self.x_val = self.x[self.n_batches_train*args.batch_size:]
-        self.u_val = self.u[self.n_batches_train*args.batch_size:]
-        self.x = self.x[:self.n_batches_train*args.batch_size]
-        self.u = self.u[:self.n_batches_train*args.batch_size]
+        x_val = x[self.n_batches_train*args.batch_size:]
+        u_val = u[self.n_batches_train*args.batch_size:]
+        x = x[:self.n_batches_train*args.batch_size]
+        u = u[:self.n_batches_train*args.batch_size]
+
+        # Create train and val datasets
+        self.train_ds = tf.data.Dataset.from_tensor_slices(
+            (x, u)).shuffle(self.n_batches_train, reshuffle_each_iteration=True).batch(args.batch_size)
+
+        self.val_ds = tf.data.Dataset.from_tensor_slices(
+            (x_val, u_val)).shuffle(self.n_batches_val, reshuffle_each_iteration=True).batch(args.batch_size)
+
+        print('shifting/scaling data...')
+        # Find means and std if not initialized to anything
+        if np.sum(self.scale_x) == 0.0:
+            self.shift_x = np.mean(x[:self.n_batches_train], axis=(0, 1))
+            self.scale_x = np.std(x[:self.n_batches_train], axis=(0, 1))
+            self.shift_u = np.mean(u[:self.n_batches_train], axis=(0, 1))
+            self.scale_u = np.std(u[:self.n_batches_train], axis=(0, 1))
+
+            # Remove very small scale values
+            self.scale_x[self.scale_x < 1e-6] = 1.0
+
+            # Set u norm params to be 0, 1 for pendulum environment
+            if args.domain_name == 'Pendulum-v0':
+                self.shift_u = np.zeros_like(self.shift_u)
+                self.scale_u = np.ones_like(self.scale_u)
+
+        # Shift and scale values for test sequence
+        self.x_test = (self.x_test - self.shift_x)/self.scale_x
+        self.u_test = (self.u_test - self.shift_u)/self.scale_u
+
+
+
+    # def _process_data(self, args):
+    #     """Create batch dicts and shuffle data
+    #     Args:
+    #         args: Various arguments and specifications
+    #     """
+    #     # Create batch_dict
+    #     self.batch_dict = {}
+
+    #     # Print tensor shapes
+    #     print('states: ', self.x.shape)
+    #     print('inputs: ', self.u.shape)
+            
+    #     self.batch_dict['states'] = np.zeros((args.batch_size, self.seq_length, args.state_dim))
+    #     self.batch_dict['inputs'] = np.zeros((args.batch_size, self.seq_length-1, args.action_dim))
+
+    def _create_split(self, args):
+        """Divide data into training/validation sets
+        Args:
+            args: Various arguments and specifications
+        """
+        
 
         # Set batch pointer for training and validation sets
         self.reset_batchptr_train()

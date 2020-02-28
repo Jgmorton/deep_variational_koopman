@@ -1,165 +1,155 @@
 import numpy as np
 import tensorflow as tf
-import pdb
 
-class VariationalKoopman():
+from tensorflow.keras.layers import Bidirectional, Dense, GRU, GRUCell, InputLayer, LSTM
+from tensorflow.keras import Model, Sequential
+
+class VariationalKoopman(Model):
     def __init__(self, args):
         """Constructs Deep Variational Koopman Model 
         Args:
             args: Various arguments and specifications
         """
-
-        # Placeholder for states and control inputs
-        self.x = tf.Variable(np.zeros((2*args.batch_size*args.seq_length, args.state_dim), dtype=np.float32), trainable=False, name="state_values")
-        self.u = tf.Variable(np.zeros((args.batch_size, 2*args.seq_length-1, args.action_dim), dtype=np.float32), trainable=False, name="action_values")
-        
-        # Placeholders for values needed for ilqr
-        self.u_ilqr = tf.Variable(np.zeros((args.batch_size, args.seq_length, args.action_dim), dtype=np.float32), trainable=False, name="action_values_ilqr")
-
-        # Parameters to be set externally
-        self.learning_rate = tf.Variable(0.0, trainable=False, name="learning_rate")
-        self.kl_weight = tf.Variable(0.0, trainable=False, name="kl_weight")
+        super(VariationalKoopman, self).__init__()
 
         # Normalization parameters to be stored
-        self.shift = tf.Variable(np.zeros(args.state_dim), trainable=False, name="state_shift", dtype=tf.float32)
-        self.scale = tf.Variable(np.zeros(args.state_dim), trainable=False, name="state_scale", dtype=tf.float32)
+        self.shift_x = tf.Variable(np.zeros(args.state_dim), trainable=False, name="state_shift", dtype=tf.float32)
+        self.scale_x = tf.Variable(np.zeros(args.state_dim), trainable=False, name="state_scale", dtype=tf.float32)
         self.shift_u = tf.Variable(np.zeros(args.action_dim), trainable=False, name="action_shift", dtype=tf.float32)
         self.scale_u = tf.Variable(np.zeros(args.action_dim), trainable=False, name="action_scale", dtype=tf.float32)
-        
-        # Create the computational graph
-        self._create_feature_extractor_params(args)
-        self._create_feature_extractor(args)
-        self._create_temporal_encoder(args)
-        self._create_inference_network_params(args)
-        self._infer_observations(args)
+
+        # Create networks
+        self._create_extractor_network(args)
+        self._create_temporal_encoder_network(args)
+        self._create_init_inference_network(args)
+        self._create_observation_encoder_network(args)
+        self._create_inference_network(args)
         self._create_prior_network(args)
-        self._propagate_solution(args)
-        self._create_decoder_params(args)
-        self._generate_predictions(args)
-        if args.ilqr:
-            self._find_ilqr_params(args)
-        self._create_optimizer(args)
+        self._create_decoder_network(args)
 
-    def _create_feature_extractor_params(self, args):
-        """Create parameters to comprise feature extractor
+    def _create_extractor_network(self, args):
+        """Create feature extractor
         Args:
             args: Various arguments and specifications
         """
-        self.extractor_w = []
-        self.extractor_b = []
+        # Initialize network
+        self.extractor_net = Sequential()
 
-        # Loop through elements of feature extractor and define parameters
-        for i in range(len(args.extractor_size)):
-            if i == 0:
-                prev_size = args.state_dim
-            else:
-                prev_size = args.extractor_size[i-1]
-            self.extractor_w.append(tf.get_variable("extractor_w"+str(i), [prev_size, args.extractor_size[i]], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-            self.extractor_b.append(tf.get_variable("extractor_b"+str(i), [args.extractor_size[i]]))
+        # Add input
+        self.extractor_net.add(InputLayer(input_shape=(args.state_dim,)))
+
+        # Loop through elements of feature extractor and define layers
+        for es in args.extractor_size:
+            self.extractor_net.add(Dense(es, activation='relu'))
 
         # Last set of weights to map to output
-        self.extractor_w.append(tf.get_variable("extractor_w_end", [args.extractor_size[-1], args.latent_dim], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-        self.extractor_b.append(tf.get_variable("extractor_b_end", [args.latent_dim]))
+        self.extractor_net.add(Dense(args.latent_dim))
 
-    def _get_extractor_output(self, args, states):
-        """Function to run inputs through extractor
-        Args:
-            args: Various arguments and specifications
-            states: states to feed into extractor [2*batch_size*seq_length, state_dim]
-        Returns:
-            Extracted features
-        """
-        extractor_input = states
-        for i in range(len(args.extractor_size)):
-            extractor_input = tf.nn.relu(tf.nn.xw_plus_b(extractor_input, self.extractor_w[i], self.extractor_b[i]))
-        output = tf.nn.xw_plus_b(extractor_input, self.extractor_w[-1], self.extractor_b[-1])
-        return output
-
-    def _create_feature_extractor(self, args):
-        """Create feature extractor (maps state -> features, assumes feature same dimensionality as latent states)
+    def _create_temporal_encoder_network(self, args):
+        """Create temporal encoder network
         Args:
             args: Various arguments and specifications
         """
-        features = self._get_extractor_output(args, self.x)
-        self.features = tf.reshape(features, [args.batch_size, 2*args.seq_length, args.latent_dim])
+        # Initialize network
+        self.temporal_encoder_net = Sequential()
 
-    def _create_temporal_encoder(self, args):
-        """Bidirectional LSTM to generate temporal encoding (also generate distribution over g1 here)
+        # Add input
+        self.temporal_encoder_net.add(InputLayer(input_shape=(args.seq_length, args.latent_dim + args.action_dim)))
+
+        #  Add bidirectional LSTM layer
+        bi_lstm = Bidirectional(LSTM(args.rnn_size), merge_mode='concat')
+        self.temporal_encoder_net.add(bi_lstm)
+
+        # Add dense layers to transform to temporal encoding
+        self.temporal_encoder_net.add(Dense(args.transform_size, activation='relu'))
+        self.temporal_encoder_net.add(Dense(args.latent_dim))
+
+    def _create_init_inference_network(self, args):
+        """Create inference network for initial observation
         Args:
             args: Various arguments and specifications
         """
-        # Define forward and backward layers
-        fwd_cell = tf.nn.rnn_cell.LSTMCell(args.rnn_size, initializer=tf.contrib.layers.xavier_initializer())
-        bwd_cell = tf.nn.rnn_cell.LSTMCell(args.rnn_size, initializer=tf.contrib.layers.xavier_initializer())
+        # Initialize network
+        self.init_inference_net = Sequential()
 
-        # Construct input -- concatenate sequence of states with sequence of actions
-        padded_u = tf.concat([tf.zeros([args.batch_size, 1, args.action_dim]), self.u[:, :(args.seq_length-1)]], axis=1)
-        rnn_input = tf.concat([self.features[:, :args.seq_length], padded_u], axis=2)
-        
-        # Get outputs from rnn and concatenate
-        outputs, _ = tf.nn.bidirectional_dynamic_rnn(fwd_cell, bwd_cell, rnn_input, dtype=tf.float32)
-        output_fw, output_bw = outputs
-        output = tf.concat([output_fw[:, -1], output_bw[:, -1]], axis=1)
+        # Add input
+        self.init_inference_net.add(InputLayer(input_shape=(2*args.latent_dim,)))
 
-        # Single transformation and affine layer into temporal encoding
-        hidden = tf.layers.dense(output, 
-                                units=args.transform_size, 
-                                activation=tf.nn.relu,
-                                kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-        self.temporal_encoding = tf.layers.dense(hidden, 
-                                    units=args.latent_dim, 
-                                    kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
+        # Add transformation to initial observation distribution
+        self.init_inference_net.add(Dense(args.transform_size, activation='relu'))
+        self.init_inference_net.add(Dense(2*args.latent_dim))
 
-        # Now construct distribution over g1 through transformation with single hidden layer
-        g_input = tf.concat([self.temporal_encoding, self.features[:, 0]], axis=1)
-        hidden = tf.layers.dense(g_input, 
-                                    units=args.transform_size, 
-                                    activation=tf.nn.relu, 
-                                    kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-        self.g1_dist = tf.layers.dense(hidden, 
-                                        units=2*args.latent_dim,
-                                        kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-
-    def _create_inference_network_params(self, args):
-        """Create parameters to comprise inference network
+    def _create_observation_encoder_network(self, args):
+        """Create observation encoder network
         Args:
             args: Various arguments and specifications
         """
-        self.inference_w = []
-        self.inference_b = []
+        # Initialize network
+        self.observation_encoder_net = Sequential()
 
-        # Loop through elements of inference network and define parameters
-        for i in range(len(args.inference_size)):
-            if i == 0:
-                prev_size = 3*args.latent_dim + args.action_dim
-            else:
-                prev_size = args.inference_size[i-1]
-            self.inference_w.append(tf.get_variable("inference_w"+str(i), [prev_size, args.inference_size[i]], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-            self.inference_b.append(tf.get_variable("inference_b"+str(i), [args.inference_size[i]]))
+        # Add input
+        self.observation_encoder_net.add(InputLayer(input_shape=(1, args.latent_dim,)))
+
+        # Initialize single-layer GRU network to create observation encodings
+        self.observation_encoder_net.add(LSTM(args.rnn_size, input_shape=(1, args.latent_dim)))
+
+        # Add in dense layers
+        self.observation_encoder_net.add(Dense(args.transform_size, activation='relu'))
+        self.observation_encoder_net.add(Dense(args.latent_dim))
+
+    def _create_inference_network(self, args):
+        """Create inference network
+        Args:
+            args: Various arguments and specifications
+        """
+        # Initialize network
+        self.inference_net = Sequential()
+
+        # Add input
+        self.inference_net.add(InputLayer(input_shape=(3*args.latent_dim + args.action_dim,)))
+
+        # Loop through elements of inference network and add layers
+        for ins in args.inference_size:
+            self.inference_net.add(Dense(ins, activation='relu'))
 
         # Last set of weights to map to output
-        self.inference_w.append(tf.get_variable("inference_w_end", [args.inference_size[-1], 2*args.latent_dim], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-        self.inference_b.append(tf.get_variable("inference_b_end", [2*args.latent_dim]))
- 
-    def _get_inference_distribution(self, args, features, u, g_enc):
-        """Function to infer distribution over g
+        self.inference_net.add(Dense(2*args.latent_dim))
+
+    def _create_prior_network(self, args):
+        """Construct network and generate paramaters for conditional prior distributions
         Args:
             args: Various arguments and specifications
-            features: Extracted features [batch_size, latent_dim]
-            u: Control input [batch_size, action_dim]
-            g_enc: Temporal encoding of previous g-values [batch_size, latent_dim]
-        Returns:
-            Next g-value
         """
-        inference_input = tf.concat([features, u, self.temporal_encoding, g_enc], axis=1)
-        for i in range(len(args.inference_size)):
-            inference_input = tf.nn.relu(tf.nn.xw_plus_b(inference_input, self.inference_w[i], self.inference_b[i]))
-        g_dist = tf.nn.xw_plus_b(inference_input, self.inference_w[-1], self.inference_b[-1])
-        return g_dist
+        # Initialize network
+        self.prior_net = Sequential()
+
+        # Add inputs
+        self.prior_net.add(InputLayer(input_shape=(args.latent_dim + args.action_dim,)))
+
+        # Add dense layers
+        for ps in args.prior_size:
+            self.prior_net.add(Dense(ps, activation='relu'))
+
+        # Final affine transform to dist params
+        self.prior_net.add(Dense(2*args.latent_dim))
+    
+    def _create_decoder_network(self, args):
+        """Create decoder network
+        Args:
+            args: Various arguments and specifications
+        """
+        # Initialize network
+        self.decoder_net = Sequential()
+
+        # Add input
+        self.decoder_net.add(InputLayer(input_shape=(args.latent_dim,)))
+
+        # Loop through elements of decoder network and define layers
+        for i in range(len(args.extractor_size)-1, -1, -1):
+            self.decoder_net.add(Dense(args.extractor_size[i], activation='tanh'))
+
+        # Last set of weights to map to output
+        self.decoder_net.add(Dense(args.state_dim))
 
     def _gen_sample(self, args, dist_params):
         """Function to generate samples given distribution parameters
@@ -173,307 +163,341 @@ class VariationalKoopman():
 
         # Make standard deviation estimates better conditioned, otherwise could be problem early in training
         g_std = tf.minimum(tf.exp(g_logstd) + 1e-6, 10.0) 
-        samples = tf.random_normal([args.batch_size, args.latent_dim], seed=args.seed)
+        samples = tf.random.normal([args.batch_size, args.latent_dim], seed=args.seed)
         g = samples*g_std + g_mean
         return g
 
-    def _infer_observations(self, args):
-        """Step through time and determine g_t distributions and values
+    def _get_features(self, args, x, u):
+        """Find features and temporal encoding given sequence of states and actions
         Args:
             args: Various arguments and specifications
+            x: State values [2*batch_size*seq_length, state_dim]
+            
+        Returns:
+            features: Feature values [batch_size, 2*seq_length, latent_dim]
+            temporal_encoding: Temporal encoding [batch_size, latent_dim]
         """
-        # Sample value for initial observation from distribution
-        self.g_t = self._gen_sample(args, self.g1_dist)
+        # Get fetures from feature extractor and reshape
+        features = self.extractor_net(x)
+        features = tf.reshape(features, [args.batch_size, 2*args.seq_length, args.latent_dim])
+
+        # Construct input to temporal encoder and get temporal encoding
+        padded_u = tf.concat([tf.zeros([args.batch_size, 1, args.action_dim]), u[:, :(args.seq_length-1)]], axis=1)
+        temp_enc_input = tf.concat([features[:, :args.seq_length], padded_u], axis=2)
+        temporal_encoding = self.temporal_encoder_net(temp_enc_input)
+
+        return features, temporal_encoding
+
+    def _get_observations(self, args, features, temporal_encoding, u):
+        """Finds inferred distributions over g-values and samples from them
+        Args:
+            args: Various arguments and specifications
+            features: Feature values [batch_size, 2*seq_length, latent_dim]
+            temporal_encoding: Temporal encoding [batch_size, latent_dim]
+            u: Action values [batch_size, 2*seq_length-1, action_dim]
+        Returns:
+            g_vals: Sampled observations [batch_size, seq_length, latent_dim]
+            g_dists: Inferred distributions over g-values [batch_size*seq_length, 2*latent_dim]
+        """
+        # Get inferred distribution over initial observation
+        init_obs_input = g_input = tf.concat([temporal_encoding, features[:, 0]], axis=1)
+        g1_dist = self.init_inference_net(init_obs_input)
+
+        # Infer remaining observations
+        g_t = self._gen_sample(args, g1_dist)
 
         # Start list of g-distributions and sampled values
-        self.g_vals = [tf.expand_dims(self.g_t, axis=1)]
-        self.g_dists = [tf.expand_dims(self.g1_dist, axis=1)]
+        g_vals = [tf.expand_dims(g_t, axis=1)]
+        g_dists = [tf.expand_dims(g1_dist, axis=1)]
 
-        # Create parameters for transformation to be performed at output of GRU in observation encoder
-        W_g_out = tf.get_variable("w_g_out", [args.rnn_size, args.transform_size], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-        b_g_out = tf.get_variable("b_g_out", [args.transform_size])
-        W_to_g_enc = tf.get_variable("w_to_g_enc", [args.transform_size, args.latent_dim], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-        b_to_g_enc = tf.get_variable("b_to_g_enc", [args.latent_dim])
+        # Initialize internal state of observation encoder
+        self.observation_encoder_net.reset_states()
 
-        # Initialize single-layer GRU network to create observation encodings
-        cell = tf.nn.rnn_cell.GRUCell(args.rnn_size, kernel_initializer=tf.contrib.layers.xavier_initializer())
-        self.rnn_state = cell.zero_state(args.batch_size, tf.float32)
-        g_t = self.g_t
-
+        # Loop through time
         for t in range(1, args.seq_length):
-            # Generate temporal encoding
-            self.rnn_output, self.rnn_state = cell(g_t, self.rnn_state)
-            hidden = tf.nn.relu(tf.nn.xw_plus_b(self.rnn_output, W_g_out, b_g_out))
-            g_enc = tf.nn.xw_plus_b(hidden, W_to_g_enc, b_to_g_enc)
+            # Update observation encoding
+            g_enc = self.observation_encoder_net(tf.expand_dims(g_t, axis=1))
 
-            # Now get distribution over g_t and sample value
-            g_dist = self._get_inference_distribution(args, self.features[:, t], self.u[:, t-1], g_enc)
+            # Get distribution and sample new observations
+            g_dist = self.inference_net(tf.concat([features[:, t], u[:, t-1], temporal_encoding, g_enc], axis=1))
             g_t = self._gen_sample(args, g_dist)
 
             # Append values to list
-            self.g_vals.append(tf.expand_dims(g_t, axis=1))
-            self.g_dists.append(tf.expand_dims(g_dist, axis=1))
+            g_vals.append(tf.expand_dims(g_t, axis=1))
+            g_dists.append(tf.expand_dims(g_dist, axis=1))
 
         # Finally, stack inferred observations
-        self.g_vals = tf.reshape(tf.stack(self.g_vals, axis=1), [args.batch_size, args.seq_length, args.latent_dim])
-        self.g_dists = tf.reshape(tf.stack(self.g_dists, axis=1), [args.batch_size*args.seq_length, 2*args.latent_dim])
+        g_vals = tf.reshape(tf.stack(g_vals, axis=1), [args.batch_size, args.seq_length, args.latent_dim])
+        g_dists = tf.reshape(tf.stack(g_dists, axis=1), [args.batch_size*args.seq_length, 2*args.latent_dim])
 
-    def _create_prior_network(self, args):
-        """Construct network and generate paramaters for conditional prior distributions
+        return g_vals, g_dists
+
+    def _get_prior_dists(self, args, g_vals, u):
+        """Derive conditional prior distributions over observations
         Args:
             args: Various arguments and specifications
+            g_vals: Sampled observations [batch_size, seq_length, latent_dim]
+            u: Action values [batch_size, 2*seq_length-1, action_dim]
+        Returns:
+            g_prior_dists: Prior distributions over g-values [batch_size*seq_length, 2*latent_dim]
         """
-        gvals_reshape = tf.reshape(self.g_vals[:, :-1], [args.batch_size*(args.seq_length-1), args.latent_dim])
-        u_reshape = tf.reshape(self.u[:, :(args.seq_length-1)], [args.batch_size*(args.seq_length-1), args.action_dim])
-        prior_input = tf.concat([gvals_reshape, u_reshape], axis=1)
-
-        # Construct layers of prior network
-        for ps in args.prior_size:
-            prior_input = tf.layers.dense(prior_input, 
-                                            units=ps, 
-                                            activation=tf.nn.relu, 
-                                            kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-
-        # Final affine transform to dist params
-        prior_params = tf.layers.dense(prior_input, 
-                                            units=2*args.latent_dim,
-                                            kernel_regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight))
-        prior_params = tf.reshape(prior_params, [args.batch_size, args.seq_length-1, 2*args.latent_dim])
-
         # Construct diagonal unit Gaussian prior params for g1
         g1_prior = tf.concat([tf.zeros([args.batch_size, 1, args.latent_dim]), tf.ones([args.batch_size, 1, args.latent_dim])], axis=2)
 
-        # Combine and reshape to get full set of prior distribution parameter values
-        g_prior = tf.concat([g1_prior, prior_params], axis=1)
+        # Construct input to prior network
+        gvals_reshape = tf.reshape(g_vals[:, :-1], [args.batch_size*(args.seq_length-1), args.latent_dim])
+        u_reshape = tf.reshape(u[:, :(args.seq_length-1)], [args.batch_size*(args.seq_length-1), args.action_dim])
+        prior_input = tf.concat([gvals_reshape, u_reshape], axis=1)
+
+        # Find parameters to prior distributions
+        prior_params = tf.reshape(self.prior_net(prior_input), [args.batch_size, args.seq_length-1, 2*args.latent_dim])
 
         # Combine and reshape to get full set of prior distribution parameter values
-        self.g_prior = tf.reshape(g_prior, [args.batch_size*args.seq_length, 2*args.latent_dim])
+        g_prior_dists = tf.concat([g1_prior, prior_params], axis=1)
 
-    def _propagate_solution(self, args):
-        """Perform least squares to get A- and B-matrices and propagate forward
+        # Combine and reshape to get full set of prior distribution parameter values
+        g_prior_dists = tf.reshape(g_prior_dists, [args.batch_size*args.seq_length, 2*args.latent_dim])
+
+        return g_prior_dists
+
+    def _derive_dynamics(self, args, g_vals, u):
+        """Perform least squares to get A- and B-matrices and propagate
         Args:
             args: Various arguments and specifications
+            g_vals: Sampled observations [batch_size, seq_length, latent_dim]
+            u: Action values [batch_size, 2*seq_length-1, action_dim]
+        Returns:
+            z_vals: Observations obtained by simulating dynamics [batch_size, seq_length, latent_dim]
         """
         # Define X- and Y-matrices
-        X = tf.concat([self.g_vals[:, :-1], self.u[:, :(args.seq_length-1)]], axis=2)
-        Y = self.g_vals[:, 1:]
+        X = tf.concat([g_vals[:, :-1], u[:, :(args.seq_length-1)]], axis=2)
+        Y = g_vals[:, 1:]
 
         # Solve for A and B using least-squares
-        self.K = tf.matrix_solve_ls(X, Y, l2_regularizer=args.l2_regularizer)
-        self.A = self.K[:, :args.latent_dim]
-        self.B = self.K[:, args.latent_dim:]
+        K = tf.linalg.lstsq(X, Y, l2_regularizer=args.l2_regularizer)
+        self.A = K[:, :args.latent_dim]
+        self.B = K[:, args.latent_dim:]
 
         # Perform least squares to find A-inverse
-        self.A_inv = tf.matrix_solve_ls(Y - tf.matmul(self.u[:, :(args.seq_length-1)], self.B), self.g_vals[:, :-1], l2_regularizer=args.l2_regularizer)
+        A_inv = tf.linalg.lstsq(Y - tf.matmul(u[:, :(args.seq_length-1)], self.B), g_vals[:, :-1], l2_regularizer=args.l2_regularizer)
         
         # Get predicted code at final time step
-        self.z_t = self.g_vals[:, -1]
+        z_t = g_vals[:, -1]
 
         # Create recursive predictions for z
-        z_t = tf.expand_dims(self.z_t, axis=1)
+        z_t = tf.expand_dims(z_t, axis=1)
         z_vals = [z_t]
         for t in range(args.seq_length-2, -1, -1):
-            u = self.u[:, t]
-            u = tf.expand_dims(u, axis=1)
-            z_t = tf.matmul(z_t - tf.matmul(u, self.B), self.A_inv)
+            u_t = u[:, t]
+            u_t = tf.expand_dims(u_t, axis=1)
+            z_t = tf.matmul(z_t - tf.matmul(u_t, self.B), A_inv)
             z_vals.append(z_t) 
-        self.z_vals_reshape = tf.stack(z_vals, axis=1)
+        z_vals_reshape = tf.stack(z_vals, axis=1)
 
         # Flip order
-        self.z_vals_reshape = tf.squeeze(tf.reverse(self.z_vals_reshape, [1]))
+        z_vals_reshape = tf.squeeze(tf.reverse(z_vals_reshape, [1]))
 
         # Reshape predicted z-values
-        self.z_vals = tf.reshape(self.z_vals_reshape, [args.batch_size*args.seq_length, args.latent_dim])
+        z_vals = tf.reshape(z_vals_reshape, [args.batch_size, args.seq_length, args.latent_dim])
 
-    def _create_decoder_params(self, args):
-        """Create parameters to comprise decoder network
+        return z_vals
+
+    def _generate_predictions(self, args, z1, u):
+        """Generate predictions for how system will evolve given z1, A, and B
         Args:
             args: Various arguments and specifications
-        """
-        self.decoder_w = []
-        self.decoder_b = []
-
-        # Loop through elements of decoder network and define parameters
-        for i in range(len(args.extractor_size)-1, -1, -1):
-            if i == len(args.extractor_size)-1:
-                prev_size = args.latent_dim
-            else:
-                prev_size = args.extractor_size[i+1]
-            self.decoder_w.append(tf.get_variable("decoder_w"+str(len(args.extractor_size)-i), [prev_size, args.extractor_size[i]], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-            self.decoder_b.append(tf.get_variable("decoder_b"+str(len(args.extractor_size)-i), [args.extractor_size[i]]))
-
-        # Last set of weights to map to output
-        self.decoder_w.append(tf.get_variable("decoder_w_end", [args.extractor_size[0], args.state_dim], 
-                                                regularizer=tf.contrib.layers.l2_regularizer(args.reg_weight)))
-        self.decoder_b.append(tf.get_variable("decoder_b_end", [args.state_dim]))
-
-    def _get_decoder_output(self, args, encodings):
-        """Function to run inputs through decoder
-        Args:
-            args: Various arguments and specifications
-            encodings: Input to decoder [2*batch_size*seq_length, latent_dim]
+            z1: Initial latent state [batch_size, latent_dim]
+            u: Action values [batch_size, 2*seq_length-1, action_dim]
         Returns:
-            output: Reconstructed states [2*batch_size*seq_length, state_dim]
+            z_pred: Observations obtained by simulating dynamics [batch_size, seq_length, latent_dim]
         """
-        decoder_input = encodings
-        for i in range(len(args.extractor_size)):
-            decoder_input = tf.nn.elu(tf.nn.xw_plus_b(decoder_input, self.decoder_w[i], self.decoder_b[i]))
-        output = tf.nn.xw_plus_b(decoder_input, self.decoder_w[-1], self.decoder_b[-1])
-        return output
-
-    def _generate_predictions(self, args):
-        """Generate predictions for how system will evolve given z1, A, and B (used for control, not during training)
-        Args:
-            args: Various arguments and specifications
-        """
-        self.z1 = tf.squeeze(self.z_vals_reshape[:, -1])
-        z_t = tf.expand_dims(self.z1, axis=1)
+        # Create predictions, simulating forward in time
+        z_t = tf.expand_dims(z1, axis=1)
         z_pred = [z_t]
         for t in range(args.seq_length, 2*args.seq_length):
-            u = self.u[:, t-1]
-            u = tf.expand_dims(u, axis=1)
-            z_t = tf.matmul(z_t, self.A) + tf.matmul(u, self.B)
+            u_t = u[:, t-1]
+            u_t = tf.expand_dims(u_t, axis=1)
+            z_t = tf.matmul(z_t, self.A) + tf.matmul(u_t, self.B)
             z_pred.append(z_t) 
         z_pred = tf.stack(z_pred, axis=1)
 
         # Reshape predicted z-values
-        self.z_pred_reshape = z_pred[:, 1:]
-        z_pred = tf.reshape(z_pred[:, 1:], [args.batch_size*args.seq_length, args.latent_dim]) 
-        self.x_future_norm = tf.reshape(self._get_decoder_output(args, z_pred), [args.batch_size, args.seq_length, args.state_dim])
-        self.x_future = self.x_future_norm*self.scale + self.shift
+        z_pred_reshape = z_pred[:, 1:]
+        z_pred = tf.reshape(z_pred[:, 1:], [args.batch_size, args.seq_length, args.latent_dim]) 
+        
+        return z_pred
 
-    def _get_cost(self, args, z_u_t):
-        """Get cost associated with a set of states and actions
+    def forward_pass(self, args, x, u):
+        """Perform forward pass, mapping states and actions to network outputs
         Args:
             args: Various arguments and specifications
-            z_u_t: Latent state and control input at given time step [batch_size, state_dim+action_dim]
+            x: State values [batch_size, 2*seq_length, state_dim]
+            u: Action values [batch_size, 2*seq_length-1, action_dim]
         Returns:
-            Cost [batch_size]
+            g_prior_dists: Prior distributions over g-values [batch_size*seq_length, 2*latent_dim]
+            g_dists: Inferred distributions over g-values [batch_size*seq_length, 2*latent_dim]
+            x_pred: State predictions [2*]
         """
-        z_t = z_u_t[:, :args.latent_dim]
-        u_t = z_u_t[:, args.latent_dim:]
-        states = self._get_decoder_output(args, z_t)*self.scale + self.shift
-        if args.domain_name == 'Pendulum-v0':
-            return tf.square(tf.atan2(states[:, 1], states[:, 0])) + 0.1*tf.square(states[:, 2]) + 0.001*tf.square(tf.squeeze(u_t))
-        else:
-            raise NotImplementedError
+        # Normalize inputs
+        x = (x - self.shift_x)/self.scale_x
+        x = tf.reshape(x, [2*args.batch_size*args.seq_length, args.state_dim])
+        u = (u - self.shift_u)/self.scale_u
 
-    def _find_ilqr_params(self, args):
-        """Find necessary params to perform iLQR
-        Args:
-            args: Various arguments and specifications
-        """
-        # Initialize state
-        z_t = self.z1
+        # Find features and temporal encoding
+        features, temporal_encoding = self._get_features(args, x, u)
 
-        # Initialize lists to hold quantities
-        L = []
-        L_x = []
-        L_u = []
-        L_xx = []
-        L_ux = []
-        L_uu = [] 
-        z_vals = [z_t]
+        # Get inferred observation distributions and sampled g-values
+        g_vals, g_dists = self._get_observations(args, features, temporal_encoding, u)
 
-        # Loop through time
-        for t in range(args.mpc_horizon):
-            # Find cost for current state
-            z_u_t = tf.concat([z_t, self.u_ilqr[:, t]], axis=1)
-            l_t = args.gamma**t*self._get_cost(args, z_u_t)
+        # Find prior distribution over g-values
+        g_prior_dists = self._get_prior_dists(args, g_vals, u)
 
-            # Find gradients and Hessians (think you need to compute Hessians this way because it handles 3d tensors weirdly)
-            grads = tf.gradients(l_t, z_u_t)[0]
-            hessians = tf.reduce_sum(tf.hessians(l_t, z_u_t)[0], axis=2)              
+        # Derive dynamics and simulate latent dynamics with model
+        z_vals = self._derive_dynamics(args, g_vals, u)
 
-            # Separate into individual components
-            l_x = grads[:, :args.latent_dim]
-            l_u = grads[:, args.latent_dim:]
-            l_xx = hessians[:, :args.latent_dim, :args.latent_dim]
-            l_ux = hessians[:, args.latent_dim:, :args.latent_dim]
-            l_uu = hessians[:, args.latent_dim:, args.latent_dim:]
+        # Simulate dynamics forward to get predicted observations
+        z_pred = self._generate_predictions(args, z_vals[:, 0], u)
 
-            # Append to lists
-            L.append(l_t)
-            L_x.append(l_x)
-            L_u.append(l_u)
-            L_xx.append(l_xx)
-            L_ux.append(l_ux)
-            L_uu.append(l_uu)
+        # Concatenate z-values and reshape
+        z_vals = tf.concat([z_vals, z_pred], axis=1)
+        z_vals = tf.reshape(z_vals, [2*args.batch_size*args.seq_length, args.latent_dim])
 
-            # Find action by passing it through tanh
-            u_t = args.action_max*tf.nn.tanh(self.u_ilqr[:, t])
-            u_t = tf.expand_dims(u_t, axis=1)
-            z_t = tf.squeeze(tf.matmul(tf.expand_dims(z_t, axis=1), self.A) + tf.matmul(u_t, self.B))
-            z_vals.append(z_t)
+        # Run z-values through decoder to get state values
+        x_pred = self.decoder_net(z_vals)
 
-        # Find cost and gradients at last time step
-        z_u_t = tf.concat([z_t, tf.zeros_like(self.u_ilqr[:, -1])], axis=1)
-        l_T = args.gamma**args.seq_length*self._get_cost(args, z_u_t)
-        grads = tf.gradients(l_T, z_u_t)[0]
-        hessians = tf.reduce_sum(tf.hessians(l_T, z_u_t)[0], axis=2)  
-        L.append(l_T)
-        L_x.append(grads[:, :args.latent_dim])
-        L_xx.append(hessians[:, :args.latent_dim, :args.latent_dim])
+        return g_dists, g_prior_dists, x_pred
 
-        # Finally stack into tensors
-        self.L = tf.stack(L, axis=1)
-        self.L_x = tf.stack(L_x, axis=1)
-        self.L_u = tf.stack(L_u, axis=1)
-        self.L_xx = tf.stack(L_xx, axis=1)
-        self.L_ux = tf.stack(L_ux, axis=1)
-        self.L_uu = tf.stack(L_uu, axis=1)
-        self.xs = tf.stack(z_vals, axis=1)
-        states_pred = self._get_decoder_output(args, tf.reshape(self.xs, [-1, args.latent_dim]))*self.scale + self.shift
-        self.states_pred = tf.reshape(states_pred, [args.batch_size, -1, args.state_dim])
 
-    def _create_optimizer(self, args):
-        """Create optimizer to minimize loss
-        Args:
-            args: Various arguments and specifications
-        """
-        # First extract mean and std for prior dists, dist over g, and dist over x
-        g_prior_mean, g_prior_logstd = tf.split(self.g_prior, [args.latent_dim, args.latent_dim], axis=1)
-        g_prior_std = tf.exp(g_prior_logstd) + 1e-6
-        g_mean, g_logstd = tf.split(self.g_dists, [args.latent_dim, args.latent_dim], axis=1)
-        g_std = tf.exp(g_logstd) + 1e-6
 
-        # Get predictions for x and reconstructions
-        self.x_pred_norm = self._get_decoder_output(args, self.z_vals)
-        self.x_pred = self.x_pred_norm*self.scale + self.shift
+    # def _get_cost(self, args, z_u_t):
+    #     """Get cost associated with a set of states and actions
+    #     Args:
+    #         args: Various arguments and specifications
+    #         z_u_t: Latent state and control input at given time step [batch_size, state_dim+action_dim]
+    #     Returns:
+    #         Cost [batch_size]
+    #     """
+    #     z_t = z_u_t[:, :args.latent_dim]
+    #     u_t = z_u_t[:, args.latent_dim:]
+    #     states = self._get_decoder_output(args, z_t)*self.scale + self.shift
+    #     if args.domain_name == 'Pendulum-v0':
+    #         return tf.square(tf.atan2(states[:, 1], states[:, 0])) + 0.1*tf.square(states[:, 2]) + 0.001*tf.square(tf.squeeze(u_t))
+    #     else:
+    #         raise NotImplementedError
 
-        # First component of loss: NLL of observed states
-        x_reshape = tf.reshape(self.x, [args.batch_size, 2*args.seq_length, args.state_dim])
-        x_pred_reshape = tf.reshape(self.x_pred_norm, [args.batch_size, args.seq_length, args.state_dim])
-        self.x_pred_init = x_pred_reshape*self.scale + self.shift # needed for ilqr
+    # def _find_ilqr_params(self, args):
+    #     """Find necessary params to perform iLQR
+    #     Args:
+    #         args: Various arguments and specifications
+    #     """
+    #     # Initialize state
+    #     z_t = self.z1
 
-        # Add in predictions for how system will evolve
-        self.x_pred_reshape = tf.concat([x_pred_reshape, self.x_future_norm], axis=1)
-        self.x_pred_reshape_unnorm = self.x_pred_reshape*self.scale + self.shift
+    #     # Initialize lists to hold quantities
+    #     L = []
+    #     L_x = []
+    #     L_u = []
+    #     L_xx = []
+    #     L_ux = []
+    #     L_uu = [] 
+    #     z_vals = [z_t]
 
-        # Prediction loss
-        self.pred_loss = tf.reduce_sum(tf.square(x_reshape - self.x_pred_reshape))
+    #     # Loop through time
+    #     for t in range(args.mpc_horizon):
+    #         # Find cost for current state
+    #         z_u_t = tf.concat([z_t, self.u_ilqr[:, t]], axis=1)
+    #         l_t = args.gamma**t*self._get_cost(args, z_u_t)
+
+    #         # Find gradients and Hessians (think you need to compute Hessians this way because it handles 3d tensors weirdly)
+    #         grads = tf.gradients(l_t, z_u_t)[0]
+    #         hessians = tf.reduce_sum(tf.hessians(l_t, z_u_t)[0], axis=2)              
+
+    #         # Separate into individual components
+    #         l_x = grads[:, :args.latent_dim]
+    #         l_u = grads[:, args.latent_dim:]
+    #         l_xx = hessians[:, :args.latent_dim, :args.latent_dim]
+    #         l_ux = hessians[:, args.latent_dim:, :args.latent_dim]
+    #         l_uu = hessians[:, args.latent_dim:, args.latent_dim:]
+
+    #         # Append to lists
+    #         L.append(l_t)
+    #         L_x.append(l_x)
+    #         L_u.append(l_u)
+    #         L_xx.append(l_xx)
+    #         L_ux.append(l_ux)
+    #         L_uu.append(l_uu)
+
+    #         # Find action by passing it through tanh
+    #         u_t = args.action_max*tf.nn.tanh(self.u_ilqr[:, t])
+    #         u_t = tf.expand_dims(u_t, axis=1)
+    #         z_t = tf.squeeze(tf.matmul(tf.expand_dims(z_t, axis=1), self.A) + tf.matmul(u_t, self.B))
+    #         z_vals.append(z_t)
+
+    #     # Find cost and gradients at last time step
+    #     z_u_t = tf.concat([z_t, tf.zeros_like(self.u_ilqr[:, -1])], axis=1)
+    #     l_T = args.gamma**args.seq_length*self._get_cost(args, z_u_t)
+    #     grads = tf.gradients(l_T, z_u_t)[0]
+    #     hessians = tf.reduce_sum(tf.hessians(l_T, z_u_t)[0], axis=2)  
+    #     L.append(l_T)
+    #     L_x.append(grads[:, :args.latent_dim])
+    #     L_xx.append(hessians[:, :args.latent_dim, :args.latent_dim])
+
+    #     # Finally stack into tensors
+    #     self.L = tf.stack(L, axis=1)
+    #     self.L_x = tf.stack(L_x, axis=1)
+    #     self.L_u = tf.stack(L_u, axis=1)
+    #     self.L_xx = tf.stack(L_xx, axis=1)
+    #     self.L_ux = tf.stack(L_ux, axis=1)
+    #     self.L_uu = tf.stack(L_uu, axis=1)
+    #     self.xs = tf.stack(z_vals, axis=1)
+    #     states_pred = self._get_decoder_output(args, tf.reshape(self.xs, [-1, args.latent_dim]))*self.scale + self.shift
+    #     self.states_pred = tf.reshape(states_pred, [args.batch_size, -1, args.state_dim])
+
+    # def _create_optimizer(self, args):
+    #     """Create optimizer to minimize loss
+    #     Args:
+    #         args: Various arguments and specifications
+    #     """
+    #     # First extract mean and std for prior dists, dist over g, and dist over x
+    #     g_prior_mean, g_prior_logstd = tf.split(self.g_prior, [args.latent_dim, args.latent_dim], axis=1)
+    #     g_prior_std = tf.exp(g_prior_logstd) + 1e-6
+    #     g_mean, g_logstd = tf.split(self.g_dists, [args.latent_dim, args.latent_dim], axis=1)
+    #     g_std = tf.exp(g_logstd) + 1e-6
+
+    #     # Get predictions for x and reconstructions
+    #     self.x_pred_norm = self._get_decoder_output(args, self.z_vals)
+    #     self.x_pred = self.x_pred_norm*self.scale + self.shift
+
+    #     # First component of loss: NLL of observed states
+    #     x_reshape = tf.reshape(self.x, [args.batch_size, 2*args.seq_length, args.state_dim])
+    #     x_pred_reshape = tf.reshape(self.x_pred_norm, [args.batch_size, args.seq_length, args.state_dim])
+    #     self.x_pred_init = x_pred_reshape*self.scale + self.shift # needed for ilqr
+
+    #     # Add in predictions for how system will evolve
+    #     self.x_pred_reshape = tf.concat([x_pred_reshape, self.x_future_norm], axis=1)
+    #     self.x_pred_reshape_unnorm = self.x_pred_reshape*self.scale + self.shift
+
+    #     # Prediction loss
+    #     self.pred_loss = tf.reduce_sum(tf.square(x_reshape - self.x_pred_reshape))
     
-        # Weight loss at t = T more heavily
-        self.pred_loss += 20.0*tf.reduce_sum(tf.square(x_reshape[:, args.seq_length-1]\
-                                                             - x_pred_reshape[:, args.seq_length-1]))
+    #     # Weight loss at t = T more heavily
+    #     self.pred_loss += 20.0*tf.reduce_sum(tf.square(x_reshape[:, args.seq_length-1]\
+    #                                                          - x_pred_reshape[:, args.seq_length-1]))
 
-        # Define reconstructed state needed for ilqr
-        self.rec_state = self._get_decoder_output(args, self.z1)*self.scale + self.shift
+    #     # Define reconstructed state needed for ilqr
+    #     self.rec_state = self._get_decoder_output(args, self.z1)*self.scale + self.shift
 
-        # Second component of loss: KLD between approximate posterior and prior
-        g_prior_dist = tf.distributions.Normal(loc=g_prior_mean, scale=g_prior_std)
-        g_dist = tf.distributions.Normal(loc=g_mean, scale=g_std)
-        self.kl_loss = tf.reduce_sum(tf.distributions.kl_divergence(g_dist, g_prior_dist))
+    #     # Second component of loss: KLD between approximate posterior and prior
+    #     g_prior_dist = tf.distributions.Normal(loc=g_prior_mean, scale=g_prior_std)
+    #     g_dist = tf.distributions.Normal(loc=g_mean, scale=g_std)
+    #     self.kl_loss = tf.reduce_sum(tf.distributions.kl_divergence(g_dist, g_prior_dist))
 
-        # Sum with regularization losses to form total cost
-        self.cost = self.pred_loss + self.kl_weight*self.kl_loss + tf.reduce_sum(tf.losses.get_regularization_losses())  
+    #     # Sum with regularization losses to form total cost
+    #     self.cost = self.pred_loss + self.kl_weight*self.kl_loss + tf.reduce_sum(tf.losses.get_regularization_losses())  
 
-        # Perform parameter update
-        optimizer = tf.train.AdamOptimizer(self.learning_rate)
-        tvars = [v for v in tf.trainable_variables()]
-        self.grads, _ = tf.clip_by_global_norm(tf.gradients(self.cost, tvars), args.grad_clip)
-        self.train = optimizer.apply_gradients(zip(self.grads, tvars))
+    #     # Perform parameter update
+    #     optimizer = tf.train.AdamOptimizer(self.learning_rate)
+    #     tvars = [v for v in tf.trainable_variables()]
+    #     self.grads, _ = tf.clip_by_global_norm(tf.gradients(self.cost, tvars), args.grad_clip)
+    #     self.train = optimizer.apply_gradients(zip(self.grads, tvars))
 
