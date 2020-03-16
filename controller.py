@@ -7,6 +7,7 @@ import warnings
 import math
 import numpy as np
 import tensorflow as tf
+import time
 
 from scipy.linalg import block_diag
 
@@ -35,32 +36,29 @@ class iLQR(BaseController):
 
     """Finite Horizon Iterative Linear Quadratic Regulator."""
 
-    def __init__(self, args, net, sess, cost, max_reg=1e10, worst_case=False):
+    def __init__(self, model, cost, max_reg=1e10, worst_case=False):
         """Constructs an iLQR solver.
         Args:
-            args: Various arguments and specifications
-            net: Neural network dynamics model
-            sess: TensorFlow session
+            model: Neural network dynamics model
             cost: Cost function.
             max_reg: Maximum regularization term to break early due to
                 divergence. This can be disabled by setting it to None.
             worst_case: whether to optimize for worst-case cost, otherwise will 
                 optimize for expected cost
         """
-        self.net = net
-        self.sess = sess
+        self.model = model
         self.cost = cost
-        self.H = args.mpc_horizon
-        self.seq_length = args.seq_length
-        self.num_models = args.num_models
+        self.H = model.mpc_horizon
+        self.seq_length = model.seq_length
+        self.num_models = model.num_models
         self.worst_case = worst_case
         if self.num_models == 1: self.worst_case = False
-        self.state_dim = args.latent_dim
-        self.full_state_dim = args.state_dim
-        self.action_dim = args.action_dim
-        self.batch_size = args.batch_size
-        self.gamma = args.gamma
-        self.action_max = args.action_max
+        self.state_dim = model.latent_dim
+        self.full_state_dim = model.state_dim
+        self.action_dim = model.action_dim
+        self.batch_size = model.batch_size
+        self.gamma = model.gamma
+        self.action_max = model.action_max
 
         # Regularization terms
         self._mu = 1.0
@@ -236,18 +234,25 @@ class iLQR(BaseController):
 
         # Initialize arrays for network input and output
         states = np.zeros((self.batch_size*n_passes, self.H+1, self.full_state_dim))
-        x_in = np.zeros((self.batch_size*n_passes, self.seq_length, self.state_dim))
+        x = np.zeros((self.batch_size*n_passes, self.seq_length, self.state_dim))
         
         # Feed in latent states and get out full state values
-        x_in[:num_models, :self.H] = xs[:, :self.H]
-        xT_in = np.zeros((self.batch_size*n_passes, self.state_dim))
-        xT_in[:num_models] = xs[:, -1]
+        x[:num_models, :self.H] = xs[:, :self.H]
+        xT = np.zeros((self.batch_size*n_passes, self.state_dim))
+        xT[:num_models] = xs[:, -1]
         for n in range(n_passes):
-            feed_in = {}
-            feed_in[self.net.z_vals_reshape] = x_in[n*self.batch_size:(n+1)*self.batch_size]
-            feed_in[self.net.z1] = xT_in[n*self.batch_size:(n+1)*self.batch_size]
-            feed_out = [self.net.x_pred_init, self.net.rec_state]
-            x_rec, xT_rec = self.sess.run(feed_out, feed_in)
+            # Construct inputs
+            x_in = x[n*self.batch_size:(n+1)*self.batch_size].reshape(-1, self.state_dim)
+            x_in = tf.convert_to_tensor(x_in, dtype=tf.float32)
+            xT_in = xT[n*self.batch_size:(n+1)*self.batch_size]
+            xT_in = tf.convert_to_tensor(xT_in, dtype=tf.float32)
+
+            # Pass to network
+            x_rec = self.model.decode(x_in)
+            x_rec = tf.reshape(x_rec, [self.batch_size, self.seq_length, self.full_state_dim])
+            xT_rec = self.model.decode(xT_in)
+
+            # Store results
             states[self.batch_size*n:(self.batch_size*(n+1)), :self.H] = x_rec[:, :self.H]
             states[self.batch_size*n:(self.batch_size*(n+1)), self.H] = xT_rec
         if self.worst_case:
@@ -312,13 +317,11 @@ class iLQR(BaseController):
 
         # Perform necessary number of passes through network
         for n in range(n_passes):
-            feed_in = {}
-            feed_in[self.net.A] = A_mats[n*self.batch_size:(n+1)*self.batch_size]
-            feed_in[self.net.B] = B_mats[n*self.batch_size:(n+1)*self.batch_size]
-            feed_in[self.net.z1] = x0_vals[n*self.batch_size:(n+1)*self.batch_size]
-            feed_in[self.net.u_ilqr] = u_vals[n*self.batch_size:(n+1)*self.batch_size]
-            feed_out = [self.net.L, self.net.L_x, self.net.L_u, self.net.L_xx, self.net.L_ux, self.net.L_uu, self.net.xs]
-            L, L_x, L_u, L_xx, L_ux, L_uu, xs = self.sess.run(feed_out, feed_in)
+            x0_in = tf.convert_to_tensor(x0_vals[n*self.batch_size:(n+1)*self.batch_size], dtype=tf.float32)
+            A_in = tf.convert_to_tensor(A_mats[n*self.batch_size:(n+1)*self.batch_size], dtype=tf.float32)
+            B_in = tf.convert_to_tensor(B_mats[n*self.batch_size:(n+1)*self.batch_size], dtype=tf.float32)
+            u_ilqr = tf.convert_to_tensor(u_vals[n*self.batch_size:(n+1)*self.batch_size], dtype=tf.float32)
+            L, L_x, L_u, L_xx, L_ux, L_uu, xs = self.model.find_ilqr_params(x0_in, A_in, B_in, u_ilqr)
 
             L_arr[self.batch_size*n:(self.batch_size*(n+1))] = L
             L_x_arr[self.batch_size*n:(self.batch_size*(n+1))] = L_x

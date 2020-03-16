@@ -3,6 +3,7 @@ import math
 import numpy as np
 import random
 import progressbar
+import pdb
 import tensorflow as tf
 
 # Class to load and preprocess data
@@ -21,6 +22,7 @@ class ReplayMemory():
         """
         self.batch_size = args.batch_size
         self.seq_length = 2*args.seq_length
+        self.val_frac = args.val_frac
         self.shift_x = np.array(model.shift_x.value())
         self.scale_x = np.array(model.scale_x.value())
         self.shift_u = np.array(model.shift_u.value())
@@ -28,17 +30,10 @@ class ReplayMemory():
         self.env = env
         self.model = model
 
-        print('validation fraction: ', args.val_frac)
+        print('validation fraction: ', self.val_frac)
 
         print("generating data...")
         self._generate_data(args)
-        # self._process_data(args)
-
-        # print('creating splits...')
-        # self._create_split(args)
-
-        # print('shifting/scaling data...')
-        # self._shift_scale(args)
 
     def _generate_data(self, args):
         """Load data from environment
@@ -109,25 +104,25 @@ class ReplayMemory():
 
         print('creating splits...')
         # Compute number of batches
-        self.n_batches = len(x)//args.batch_size
-        self.n_batches_val = int(math.floor(args.val_frac * self.n_batches))
+        self.n_batches = len(x)//self.batch_size
+        self.n_batches_val = int(math.floor(self.val_frac * self.n_batches))
         self.n_batches_train = self.n_batches - self.n_batches_val
 
         print('num training batches: ', self.n_batches_train)
         print('num validation batches: ', self.n_batches_val)
 
         # Divide into train and validation datasets
-        x_val = x[self.n_batches_train*args.batch_size:]
-        u_val = u[self.n_batches_train*args.batch_size:]
-        x = x[:self.n_batches_train*args.batch_size]
-        u = u[:self.n_batches_train*args.batch_size]
+        x_val = x[self.n_batches_train*self.batch_size:]
+        u_val = u[self.n_batches_train*self.batch_size:]
+        x = x[:self.n_batches_train*self.batch_size]
+        u = u[:self.n_batches_train*self.batch_size]
 
         # Create train and val datasets
         self.train_ds = tf.data.Dataset.from_tensor_slices(
-            (x, u)).shuffle(self.n_batches_train, reshuffle_each_iteration=True).batch(args.batch_size)
+            (x, u)).shuffle(self.n_batches_train, reshuffle_each_iteration=True).batch(self.batch_size)
 
         self.val_ds = tf.data.Dataset.from_tensor_slices(
-            (x_val, u_val)).shuffle(self.n_batches_val, reshuffle_each_iteration=True).batch(args.batch_size)
+            (x_val, u_val)).shuffle(self.n_batches_val, reshuffle_each_iteration=True).batch(self.batch_size)
 
         print('shifting/scaling data...')
         # Find means and std if not initialized to anything
@@ -145,68 +140,11 @@ class ReplayMemory():
                 self.shift_u = np.zeros_like(self.shift_u)
                 self.scale_u = np.ones_like(self.scale_u)
 
-        # Shift and scale values for test sequence
-        self.x_test = (self.x_test - self.shift_x)/self.scale_x
-        self.u_test = (self.u_test - self.shift_u)/self.scale_u
-
-
-
-    # def _process_data(self, args):
-    #     """Create batch dicts and shuffle data
-    #     Args:
-    #         args: Various arguments and specifications
-    #     """
-    #     # Create batch_dict
-    #     self.batch_dict = {}
-
-    #     # Print tensor shapes
-    #     print('states: ', self.x.shape)
-    #     print('inputs: ', self.u.shape)
-            
-    #     self.batch_dict['states'] = np.zeros((args.batch_size, self.seq_length, args.state_dim))
-    #     self.batch_dict['inputs'] = np.zeros((args.batch_size, self.seq_length-1, args.action_dim))
-
-    def _create_split(self, args):
-        """Divide data into training/validation sets
-        Args:
-            args: Various arguments and specifications
-        """
-        
-
-        # Set batch pointer for training and validation sets
-        self.reset_batchptr_train()
-        self.reset_batchptr_val()
-
-    def _shift_scale(self, args):
-        """Shift and scale data to be zero-mean, unit variance
-        Args:
-            args: Various arguments and specifications
-        """
-        # Find means and std if not initialized to anything
-        if np.sum(self.scale_x) == 0.0:
-            self.shift_x = np.mean(self.x[:self.n_batches_train], axis=(0, 1))
-            self.scale_x = np.std(self.x[:self.n_batches_train], axis=(0, 1))
-            self.shift_u = np.mean(self.u[:self.n_batches_train], axis=(0, 1))
-            self.scale_u = np.std(self.u[:self.n_batches_train], axis=(0, 1))
-
-            # Remove very small scale values
-            self.scale_x[self.scale_x < 1e-6] = 1.0
-
-            # Set u norm params to be 0, 1 for pendulum environment
-            if args.domain_name == 'Pendulum-v0':
-                self.shift_u = np.zeros_like(self.shift_u)
-                self.scale_u = np.ones_like(self.scale_u)
-
-        # Shift and scale values for test sequence
-        self.x_test = (self.x_test - self.shift_x)/self.scale_x
-        self.u_test = (self.u_test - self.shift_u)/self.scale_u
-
-    def update_data(self, x_new, u_new, val_frac):
+    def update_data(self, x_new, u_new):
         """Update training/validation data
         Args:
             x_new: New state values
             u_new: New control inputs
-            val_frac: Fraction of new data to include in validation set
         """
         # First permute data
         p = np.random.permutation(len(x_new))
@@ -214,67 +152,26 @@ class ReplayMemory():
         u_new = u_new[p]
 
         # Divide new data into training and validation components
-        n_seq_val = max(int(math.floor(val_frac * len(x_new))), 1)
+        n_seq_val = max(int(math.floor(self.val_frac * len(x_new))), 1)
         n_seq_train = len(x_new) - n_seq_val
         x_new_val = x_new[n_seq_train:]
         u_new_val = u_new[n_seq_train:]
         x_new = x_new[:n_seq_train]
         u_new = u_new[:n_seq_train]
 
+        # Create datasets for new data
+        new_train_ds = tf.data.Dataset.from_tensor_slices(
+            (x_new, u_new)).shuffle(n_seq_train, reshuffle_each_iteration=True).batch(self.batch_size)
+
+        new_val_ds = tf.data.Dataset.from_tensor_slices(
+            (x_new_val, u_new_val)).shuffle(self.n_batches_val, reshuffle_each_iteration=True).batch(self.batch_size)
+
         # Now update training and validation data
-        self.x = np.concatenate((x_new, self.x), axis=0)
-        self.u = np.concatenate((u_new, self.u), axis=0)
-        self.x_val = np.concatenate((x_new_val, self.x_val), axis=0)
-        self.u_val = np.concatenate((u_new_val, self.u_val), axis=0)
+        self.train_ds.concatenate(new_train_ds)
+        self.val_ds.concatenate(new_val_ds)
 
         # Update sizes of train and val sets
-        self.n_batches_train = len(self.x)//self.batch_size
-        self.n_batches_val = len(self.x_val)//self.batch_size
+        self.n_batches_train += len(x_new)//self.batch_size
+        self.n_batches_val += len(x_new_val)//self.batch_size
 
-    def next_batch_train(self):
-        """Sample a new batch from training data
-        Args:
-            None
-        Returns:
-            batch_dict: Batch of training data
-        """
-        # Extract next batch
-        batch_index = self.batch_permuation_train[self.batchptr_train*self.batch_size:(self.batchptr_train+1)*self.batch_size]
-        self.batch_dict['states'] = (self.x[batch_index] - self.shift_x)/self.scale_x
-        self.batch_dict['inputs'] = (self.u[batch_index] - self.shift_u)/self.scale_u
-
-        # Update pointer
-        self.batchptr_train += 1
-        return self.batch_dict
-
-    def reset_batchptr_train(self):
-        """Reset pointer to first batch in training set
-        Args:
-            None
-        """
-        self.batch_permuation_train = np.random.permutation(len(self.x))
-        self.batchptr_train = 0
-
-    def next_batch_val(self):
-        """Sample a new batch from validation data
-        Args:
-            None
-        Returns:
-            batch_dict: Batch of validation data
-        """
-        # Extract next validation batch
-        batch_index = range(self.batchptr_val*self.batch_size,(self.batchptr_val+1)*self.batch_size)
-        self.batch_dict['states'] = (self.x_val[batch_index] - self.shift_x)/self.scale_x
-        self.batch_dict['inputs'] = (self.u_val[batch_index] - self.shift_u)/self.scale_u
-
-        # Update pointer
-        self.batchptr_val += 1
-        return self.batch_dict
-
-    def reset_batchptr_val(self):
-        """Reset pointer to first batch in validation set
-        Args:
-            None
-        """
-        self.batchptr_val = 0
 
