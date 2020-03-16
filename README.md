@@ -8,6 +8,7 @@ A description of the individual files is given below.
 * ```replay_memory.py``` - script for loading and processing data prior to and during training.
 * ```utils.py``` - contains functions for visualizing performance of trained models and performing MPC rollouts.
 * ```controller.py``` - script for performing DDP (essentially iLQR) for optimizing action sequences.
+
 Check branch ```tensorflow2``` for an implementation in Tensorflow 2
 
 ### Training and Evaluating a Model
