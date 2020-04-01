@@ -1,18 +1,13 @@
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import argparse
 import gym
 import numpy as np
-import pdb
+import os
 import progressbar
 import random
 import tensorflow as tf
 import time
 
-from replay_memory import ReplayMemory
-from variational_koopman_model import VariationalKoopman
-from utils import visualize_predictions, perform_rollouts, perform_mpc
+from variational_koopman import ReplayMemory, VariationalKoopman, visualize_predictions, perform_rollouts
 
 
 def main():
@@ -142,7 +137,6 @@ def train(args, model, env):
             kl_loss.reset_states()
             
             # Loop over batches
-            pdb.set_trace()
             for x, u in replay_memory.train_ds:
                 start = time.time()
 
